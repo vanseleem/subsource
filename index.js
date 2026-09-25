@@ -4,7 +4,7 @@ const express = require('express');
 const fetch   = require('node-fetch');
 const AdmZip  = require('adm-zip');
 const app     = express();
-const PORT    = process.env.PORT || 7860;
+const serverless = require('serverless-http');
 
 const BASE_URL = process.env.SPACE_HOST
   ? `https://${process.env.SPACE_HOST}`
@@ -584,7 +584,5 @@ async function handleRequest(req, res) {
   res.json({ subtitles });
 }
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`\nVan Subs v34 — advanced engine — port ${PORT}`);
-  console.log(`BASE_URL: ${BASE_URL}`);
+const serverless = require('serverless-http');
 });
