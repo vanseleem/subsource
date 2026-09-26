@@ -1,18 +1,12 @@
 'use strict';
 
-const express = require('express');
-const fetch   = require('node-fetch');
-const AdmZip  = require('adm-zip');
-const app     = express();
+const express    = require('express');
+const fetch      = require('node-fetch');
+const AdmZip     = require('adm-zip');
 const serverless = require('serverless-http');
+const app        = express();
 
-const BASE_URL = process.env.SPACE_HOST
-  ? `https://${process.env.SPACE_HOST}`
-  : `http://localhost:${PORT}`;
-
-// ── TUNE THESE ───────────────────────────────────────────────────────────────
-const MAX_SUBS_PER_LANG = 2;   // subtitles returned per language (1 = 1×EN + 1×AR)
-// ─────────────────────────────────────────────────────────────────────────────
+const MAX_SUBS_PER_LANG = 2;
 
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -44,16 +38,19 @@ app.get('/manifest.json', (req, res) => {
 app.get('/subtitles/:type/:id.json',        (req, res) => handleRequest(req, res));
 app.get('/subtitles/:type/:id/:extra.json', (req, res) => handleRequest(req, res));
 
-app.get('/health', (req, res) => res.json({
-  status:   'ok',
-  version:  '34.0.0',
-  cache:    cache.size,
-  zips:     subStore.size,
-  uptime:   Math.floor(process.uptime()) + 's',
-  base_url: BASE_URL
-}));
+app.get('/health', (req, res) => {
+  const protocol = req.headers['x-forwarded-proto'] || 'https';
+  const host     = req.headers.host;
+  res.json({
+    status:   'ok',
+    version:  '34.0.0',
+    cache:    cache.size,
+    zips:     subStore.size,
+    uptime:   Math.floor(process.uptime()) + 's',
+    base_url: `${protocol}://${host}`
+  });
+});
 
-// ── In‑memory caches (unchanged) ─────────────────────────────────────────
 const cache = new Map();
 const TTL_MOVIE   = 7 * 24 * 60 * 60 * 1000;
 const TTL_EPISODE = 8 * 60 * 60 * 1000;
@@ -79,7 +76,6 @@ setInterval(() => {
   }
 }, 30 * 60 * 1000);
 
-// ── Helper functions from the original SubSource (unchanged) ──────────────
 function seasonEpisodeFromFilename(filename) {
   if (!filename) return { season: null, episode: null };
   const n = filename.toLowerCase();
@@ -90,7 +86,6 @@ function seasonEpisodeFromFilename(filename) {
   return { season: null, episode: null };
 }
 
-// ── NEW: Foreign language signals (from SubDL) ─────────────────────────────
 const FOREIGN_SIGNALS = [
   'italian','italiano','[ita]','(ita)','.ita.','-ita.','_ita.','.ita-','_ita_','-ita-',
   '.it.','-it.','_it.','[it]','(it)','it.srt','it.ass',
@@ -112,7 +107,6 @@ function isForeignFilename(filename) {
   return FOREIGN_SIGNALS.some(s => n.includes(s));
 }
 
-// ── NEW: AI garbage / human verification (from SubDL) ──────────────────────
 function isHumanVerified(filename) {
   const AI_GARBAGE = [
     'ai-translated','machine translation','chatgpt','translated from','auto-translated',
@@ -125,7 +119,6 @@ function isHumanVerified(filename) {
   return !AI_GARBAGE.some(f => n.includes(f));
 }
 
-// ── NEW: Unwanted subtitle patterns (from SubDL) ────────────────────────────
 const UNWANTED = [
   '.forced.','.forced_','_forced.','[forced]','(forced)',
   'en.forced','ar.forced','fr.forced','forced.sub',
@@ -138,7 +131,6 @@ function isUnwantedSubtitle(filename) {
   return UNWANTED.some(f => n.includes(f));
 }
 
-// ── NEW: Advanced scoring (from SubDL) ──────────────────────────────────────
 const FORMAT_TIERS = [
   { name: 'bluray', tags: ['bluray','blu-ray','bdrip','bdremux','remux'], pts: 17 },
   { name: 'web',    tags: ['webdl','web-dl','webrip','web-rip'], pts: 17 },
@@ -184,80 +176,49 @@ function scoreTrack(filename, streamTitle, rating = 0, season = null, episode = 
   const strmTokens = normalizeRelease(streamTitle || '');
   let s = 0;
   const isMovie = contentType === 'movie';
-
-  // Episode matching (for series)
   if (season != null && episode != null) {
     const pat = `s${String(season).padStart(2,'0')}e${String(episode).padStart(2,'00')}`;
     if (n.includes(pat)) s += 500;
-    else {
-      const loose = `s${season}e${episode}`;
-      if (loose !== pat && n.includes(loose)) s += 500;
-    }
+    else { const loose = `s${season}e${episode}`; if (loose !== pat && n.includes(loose)) s += 500; }
   }
-
-  // Format tier matching
   const subTier  = detectTier(n);
   let   strmTier = detectTier(streamTitle || '');
   if (!strmTier && !streamTitle) strmTier = FORMAT_TIERS.find(t => t.name === 'web') || null;
   if (subTier) {
-    if (strmTier) {
-      s += subTier.name === strmTier.name ? subTier.pts * 2 : -120;
-    } else {
-      s += subTier.pts;
-    }
+    if (strmTier) { s += subTier.name === strmTier.name ? subTier.pts * 2 : -120; }
+    else           { s += subTier.pts; }
   }
-
-  // Release group matching
   const subGroup  = extractReleaseGroup(filename);
   const strmGroup = extractReleaseGroup(streamTitle || '');
   if (subGroup && strmGroup && subGroup === strmGroup)  s += 15;
   else if (subGroup && strmTokens.includes(subGroup)) s += 15;
-
-  // Rating boost
-  if (isMovie) {
-    if (rating > 0) s += Math.round(rating * (lang === 'Arabic' ? 6 : 18));
-  } else {
-    if (rating > 0) s += Math.round(rating * 4);
-  }
-
-  // Year match from stream title
+  if (isMovie) { if (rating > 0) s += Math.round(rating * (lang === 'Arabic' ? 6 : 18)); }
+  else          { if (rating > 0) s += Math.round(rating * 4); }
   if (streamTitle) {
     const m = streamTitle.match(/\b(19|20)\d{2}\b/);
     if (m && n.includes(m[0])) s += 50;
   }
-
-  // Codec / resolution / audio bonuses (from SubDL)
   const VIDEO_CODECS = { x265: 8, x264: 7, hevc: 8, h265: 8, h264: 7 };
   const RESOLUTIONS  = { '2160p': 2, '4k': 2, 'uhd': 2, '1080p': 2, '720p': 1 };
   const AUDIO_CODECS = { 'truehd.atmos': 3, 'truehd': 2, 'atmos': 2, 'ddp5.1': 3, 'ddp5': 2, 'ddp': 1, 'dts-hd': 3, 'dts.hd': 3, 'dts': 2, 'ac3': 1, 'aac': 1, 'eac3': 2 };
   for (const [tag, pts] of Object.entries(VIDEO_CODECS)) { if (n.includes(tag)) { s += pts; break; } }
   for (const [tag, pts] of Object.entries(RESOLUTIONS))  { if (n.includes(tag)) { s += pts; break; } }
   for (const [tag, pts] of Object.entries(AUDIO_CODECS)) { if (n.includes(tag)) { s += pts; break; } }
-
-  // Sync keywords
   const SYNC_BOOST   = ['sync','synced','corrected','fixed','updated','proper','repack','retail','remux','bd.sync','bluray.sync'];
   const SYNC_PENALTY = ['unsynced','unsync','rough','workprint','not.synced','not_synced','notsynced','raw.sub','raw_sub'];
   SYNC_BOOST.forEach(b   => { if (n.includes(b)) s += 30; });
   SYNC_PENALTY.forEach(p => { if (n.includes(p)) s -= 60; });
-
-  // File extension preference (SRT is usually best)
   if (/\.srt$/i.test(filename)) s += 15;
-
-  // Hearing impaired / SDH penalty
   if (/\b(sdh|hearing.impaired)\b/i.test(n)) s -= 20;
-
   return s;
 }
 
-// ── ZIP handling with foreign‑language filter (adapted from SubDL) ────────
 function pickFileFromZip(zip, lang, season, episode) {
   let entries = zip.getEntries()
     .filter(e => !e.isDirectory)
     .filter(e => /\.(srt|ass|ssa|vtt)$/i.test(e.entryName))
-    .filter(e => !isForeignFilename(e.entryName));   // <-- NEW: reject foreign files
-
+    .filter(e => !isForeignFilename(e.entryName));
   if (!entries.length) return null;
-
   if (season != null && episode != null) {
     const padded = `s${String(season).padStart(2,'0')}e${String(episode).padStart(2,'0')}`;
     const loose  = `s${season}e${episode}`;
@@ -265,22 +226,17 @@ function pickFileFromZip(zip, lang, season, episode) {
                 || entries.find(e => e.entryName.toLowerCase().includes(loose));
     if (exact) return exact;
   }
-
   const hints = lang === 'Arabic'
     ? ['arabic','arab','.ar.','_ar_','.ara.','_ara_','ar.srt','ar.ass','-ar.','-ara.']
     : ['english','eng','.en.','_en_','.eng.','_eng_','en.srt','en.ass','-en.','-eng.'];
   const hinted = entries.find(e => hints.some(h => e.entryName.toLowerCase().includes(h)));
   if (hinted) return hinted;
-
   if (entries.length === 1) return entries[0];
-
-  // Fallback: Arabic usually smallest, English largest
   return [...entries].sort((a, b) =>
     lang === 'Arabic' ? a.header.size - b.header.size : b.header.size - a.header.size
   )[0];
 }
 
-// ── SubSource‑specific download headers (unchanged) ────────────────────────
 const DOWNLOAD_HEADERS = {
   'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   'Accept':          'application/zip, application/octet-stream, */*',
@@ -290,11 +246,10 @@ const DOWNLOAD_HEADERS = {
   'Referer':         'https://subsource.net/',
 };
 
-async function resolveUrl(rawUrl, lang, season, episode) {
+async function resolveUrl(req, rawUrl, lang, season, episode) {
   if (/\.(srt|ass|ssa|vtt)(\?|$)/i.test(rawUrl)) {
     return { url: rawUrl, extractedName: null };
   }
-
   async function downloadWithFallback(dlUrl) {
     let r = await safeFetch(dlUrl, { headers: DOWNLOAD_HEADERS }, 20000);
     if (r && r.ok) return r;
@@ -315,14 +270,10 @@ async function resolveUrl(rawUrl, lang, season, episode) {
     }
     return r;
   }
-
   try {
     const r = await downloadWithFallback(rawUrl);
-    if (!r || !r.ok) {
-      console.error(`[ZIP] HTTP ${r?.status || 'null'} – all attempts failed`);
-      return null;
-    }
-    const buf  = await r.buffer();
+    if (!r || !r.ok) { console.error(`[ZIP] HTTP ${r?.status || 'null'} – all attempts failed`); return null; }
+    const buf = await r.buffer();
     if (buf.length < 4 || buf[0] !== 0x50 || buf[1] !== 0x4b) {
       console.log(`[ZIP] Not a ZIP (${buf.length}B), treating as direct subtitle`);
       return { url: rawUrl, extractedName: null };
@@ -333,8 +284,11 @@ async function resolveUrl(rawUrl, lang, season, episode) {
     const ext = best.entryName.split('.').pop().toLowerCase();
     const id  = `s${++subSeq}`;
     subStore.set(id, { buffer: best.getData(), ext });
+    const protocol  = req.headers['x-forwarded-proto'] || 'https';
+    const host      = req.headers.host;
+    const publicUrl = `${protocol}://${host}/sub/${id}.${ext}`;
     console.log(`[ZIP] "${best.entryName}" (${best.header.size}B) lang=${lang} → /sub/${id}`);
-    return { url: `${BASE_URL}/sub/${id}.${ext}`, extractedName: best.entryName };
+    return { url: publicUrl, extractedName: best.entryName };
   } catch (e) {
     console.error(`[ZIP] error: ${e.message}`);
     return null;
@@ -351,7 +305,6 @@ app.get('/sub/:id', (req, res) => {
   res.send(item.buffer);
 });
 
-// ── Remaining SubSource API helpers (unchanged) ────────────────────────────
 const ALLOWED_LANGS = new Set(['arabic', 'english']);
 function isAllowedLanguage(lang) { return ALLOWED_LANGS.has((lang || '').toLowerCase().trim()); }
 
@@ -419,14 +372,13 @@ function normalizeSub(raw, lang) {
   filename = filename.trim() || `SubSource-${id}`;
   return {
     filename,
-    url:            `https://api.subsource.net/api/v1/subtitles/${id}/download`,
+    url:             `https://api.subsource.net/api/v1/subtitles/${id}/download`,
     lang,
-    rating:         parseFloat(raw.rating) || 0,
+    rating:          parseFloat(raw.rating) || 0,
     hearingImpaired: raw.hearingImpaired === true || raw.hearingImpaired === 'true' || false,
   };
 }
 
-// ── Updated fetchSubtitlesFromSubSource (still uses SubSource API) ─────────
 async function fetchSubtitlesFromSubSource(imdbId, type, season, episode, streamTitle) {
   let movieId = await searchMovieByImdb(imdbId);
   if (!movieId && streamTitle) {
@@ -437,7 +389,6 @@ async function fetchSubtitlesFromSubSource(imdbId, type, season, episode, stream
     if (cleanTitle) movieId = await searchMovieByText(cleanTitle);
   }
   if (!movieId) { console.log(`║  [SS] Not found`); return { arabic: [], english: [] }; }
-
   const isEpisode = type === 'series' && season != null && episode != null;
   const tasks = isEpisode
     ? [
@@ -450,13 +401,11 @@ async function fetchSubtitlesFromSubSource(imdbId, type, season, episode, stream
         { lang: 'Arabic',  name: 'arabic',  s: null, e: null },
         { lang: 'English', name: 'english', s: null, e: null },
       ];
-
   const results = await Promise.all(
     tasks.map(t => fetchSubsForLang(movieId, t.name, t.s, t.e)
       .then(raws => raws.map(r => normalizeSub(r, t.lang)).filter(Boolean))
     )
   );
-
   let arabic = [], english = [];
   if (isEpisode) {
     const [arEp, arPk, enEp, enPk] = results;
@@ -467,7 +416,6 @@ async function fetchSubtitlesFromSubSource(imdbId, type, season, episode, stream
     arabic  = dedup(results[0]);
     english = dedup(results[1]);
   }
-
   console.log(`║  [SS] AR=${arabic.length} EN=${english.length}`);
   return { arabic, english };
 }
@@ -489,7 +437,6 @@ function dedup(arr) {
   });
 }
 
-// ── Main request handler – now uses the advanced filtering & scoring ───────
 async function handleRequest(req, res) {
   const { type } = req.params;
   const rawId    = req.params.id.replace('.json', '');
@@ -514,13 +461,11 @@ async function handleRequest(req, res) {
     return res.json({ subtitles: hit.subtitles });
   }
 
-  // Fetch raw subtitles
   let arabic = [], english = [];
   try {
     ({ arabic, english } = await fetchSubtitlesFromSubSource(imdbId, type, season, episode, streamTitle));
   } catch (e) { console.error(`║  [SS] FATAL: ${e.message}`); }
 
-  // ── Apply the SubDL‑inspired filters ──────────────────────────────────────
   const filterAndDedup = (arr, lang) => {
     const seen = new Set();
     return arr.filter(s => {
@@ -529,7 +474,6 @@ async function handleRequest(req, res) {
       if (isForeignFilename(s.filename))     { console.log(`║  [FOREIGN-DROP] "${s.filename}"`); return false; }
       if (isUnwantedSubtitle(s.filename))    { console.log(`║  [UNWANTED-DROP] "${s.filename}"`);return false; }
       if (!isAllowedLanguage(lang))          return false;
-      // dedup (in‑place)
       const key = s.filename.toLowerCase().replace(/[\s.\-_]+/g, '.');
       if (seen.has(key)) return false;
       seen.add(key);
@@ -540,34 +484,29 @@ async function handleRequest(req, res) {
   english = filterAndDedup(english, 'english');
   arabic  = filterAndDedup(arabic, 'arabic');
 
-  // ── Score using the advanced function ─────────────────────────────────────
   const scoredEnglish = english.map(s => ({
-    ...s,
-    _score: scoreTrack(s.filename, streamTitle, s.rating, season, episode, 'english', type)
+    ...s, _score: scoreTrack(s.filename, streamTitle, s.rating, season, episode, 'english', type)
   })).sort((a, b) => b._score - a._score);
 
   const scoredArabic = arabic.map(s => ({
-    ...s,
-    _score: scoreTrack(s.filename, streamTitle, s.rating, season, episode, 'arabic', type)
+    ...s, _score: scoreTrack(s.filename, streamTitle, s.rating, season, episode, 'arabic', type)
   })).sort((a, b) => b._score - a._score);
 
   const topEnglish = scoredEnglish.slice(0, MAX_SUBS_PER_LANG);
   const topArabic  = scoredArabic.slice(0, MAX_SUBS_PER_LANG);
 
-  // ── Resolve URLs (ZIP extraction, etc.) ────────────────────────────────────
-  const resolveAll = async (arr) => {
+  const resolveAll = async (arr, lang) => {
     const out = await Promise.all(arr.map(async s => {
-      const result = await resolveUrl(s.url, s.lang, season, episode);
+      const result = await resolveUrl(req, s.url, lang, season, episode);
       if (!result) return null;
       return { ...s, url: result.url, filename: result.extractedName || s.filename };
     }));
     return out.filter(Boolean);
   };
 
-  const resEnglish = await resolveAll(topEnglish);
-  const resArabic  = await resolveAll(topArabic);
+  const resEnglish = await resolveAll(topEnglish, 'English');
+  const resArabic  = await resolveAll(topArabic, 'Arabic');
 
-  // ── Build final Stremio‑compatible list (English first, then Arabic) ──────
   const subtitles = [...resEnglish, ...resArabic].map((s, i) => ({
     id:   `van_${s.lang === 'Arabic' ? 'ar' : 'en'}_${imdbId}_${i}`,
     url:  s.url,
@@ -584,5 +523,4 @@ async function handleRequest(req, res) {
   res.json({ subtitles });
 }
 
-const serverless = require('serverless-http');
-});
+module.exports.handler = serverless(app);
